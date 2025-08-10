@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -315,6 +315,172 @@ async def chat(request: ChatRequest):
             "message": {"role": "assistant", "content": text or ""},
             "done": True,
         }
+
+@app.get("/ui", response_class=HTMLResponse)
+async def ui():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HF Ollama Proxy - Chat</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #0b1020; color: #e6e6f0; }
+    .container { max-width: 860px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 20px; margin: 0 0 16px; }
+    .card { background: #11162a; border: 1px solid #1f2745; border-radius: 12px; overflow: hidden; }
+    .header { padding: 14px 16px; border-bottom: 1px solid #1f2745; display: flex; align-items: center; justify-content: space-between; }
+    .status { font-size: 12px; opacity: 0.8; }
+    .messages { height: 52vh; overflow-y: auto; padding: 16px; display: flex; gap: 12px; flex-direction: column; }
+    .msg { padding: 12px 14px; border-radius: 10px; max-width: 80%; white-space: pre-wrap; line-height: 1.45; }
+    .user { align-self: flex-end; background: #2a355f; }
+    .assistant { align-self: flex-start; background: #162035; }
+    .inputbar { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #1f2745; background: #0e1429; }
+    input[type="text"] { flex: 1; padding: 12px 12px; border-radius: 10px; border: 1px solid #28325a; background: #0b1020; color: #e6e6f0; outline: none; }
+    button { background: #4051b5; color: white; border: 0; border-radius: 10px; padding: 10px 14px; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .small { font-size: 12px; color: #b4b9d6; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>HF Ollama Proxy — Chat</h1>
+    <div class="card">
+      <div class="header">
+        <div>
+          <div class="small">Connected to proxy</div>
+          <div class="status" id="status">Idle</div>
+        </div>
+        <button id="ping">Ping</button>
+      </div>
+      <div class="messages" id="messages"></div>
+      <div class="inputbar">
+        <input id="prompt" type="text" placeholder="Ask anything..." />
+        <button id="send">Send</button>
+      </div>
+    </div>
+    <p class="small">This UI sends requests to <code>/api/chat</code> with streaming and displays tokens as they arrive. Use your Space URL in Ollama-compatible clients.</p>
+  </div>
+  <script>
+    const messagesEl = document.getElementById('messages');
+    const promptEl = document.getElementById('prompt');
+    const sendBtn = document.getElementById('send');
+    const statusEl = document.getElementById('status');
+    const pingBtn = document.getElementById('ping');
+
+    function addMessage(role, text) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + (role === 'user' ? 'user' : 'assistant');
+      div.textContent = text;
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return div;
+    }
+
+    async function ping() {
+      statusEl.textContent = 'Pinging...';
+      try {
+        const res = await fetch('/api/health');
+        const ok = await res.json();
+        statusEl.textContent = 'Health: ' + ok.status;
+      } catch (e) {
+        statusEl.textContent = 'Ping failed';
+      }
+    }
+
+    async function send() {
+      const userText = promptEl.value.trim();
+      if (!userText) return;
+      promptEl.value = '';
+      sendBtn.disabled = true;
+
+      addMessage('user', userText);
+      const assistantDiv = addMessage('assistant', '');
+
+      const body = {
+        model: 'proxied-model',
+        messages: [
+          { role: 'user', content: userText }
+        ],
+        stream: true,
+        temperature: 0.7,
+        max_tokens: 256
+      };
+
+      statusEl.textContent = 'Requesting...';
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+
+        if (!res.ok) {
+          statusEl.textContent = 'Error ' + res.status;
+          assistantDiv.textContent = '(Request failed)';
+          sendBtn.disabled = false;
+          return;
+        }
+
+        statusEl.textContent = 'Streaming...';
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+
+        let buffer = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += dec.decode(value, { stream: true });
+
+          let idx;
+          while ((idx = buffer.indexOf('\n\n')) !== -1) {
+            const chunk = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 2);
+            if (!chunk) continue;
+            if (chunk.startsWith('data: ')) {
+              const jsonStr = chunk.slice(6);
+              if (jsonStr === '[DONE]') continue;
+              try {
+                const obj = JSON.parse(jsonStr);
+                if (obj.response) {
+                  assistantDiv.textContent += obj.response;
+                  messagesEl.scrollTop = messagesEl.scrollHeight;
+                }
+                if (obj.done) {
+                  statusEl.textContent = 'Done';
+                }
+              } catch (_) {}
+            }
+          }
+        }
+
+      } catch (e) {
+        statusEl.textContent = 'Network error';
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+
+    sendBtn.addEventListener('click', send);
+    promptEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        send();
+      }
+    });
+    pingBtn.addEventListener('click', ping);
+
+    // Initial ping
+    ping();
+  </script>
+</body>
+</html>
+"""
+
+@app.get("/ui/ping")
+async def ui_ping():
+    return {"status": "ok"}
 
 @app.get("/")
 async def root():
