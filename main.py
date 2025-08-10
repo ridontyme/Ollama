@@ -104,7 +104,7 @@ async def stream_from_llm_space(prompt: str, temperature: float = 0.7, max_token
                                         
                                         if chunk.strip() == "[DONE]":
                                             break
-                                            
+                                        
                                         data = json.loads(chunk)
                                         
                                         # Extract text from various possible formats
@@ -125,7 +125,7 @@ async def stream_from_llm_space(prompt: str, temperature: float = 0.7, max_token
                                                 "done": False
                                             }
                                             yield f"data: {json.dumps(ollama_response)}\n\n"
-                                            
+                                        
                                     except json.JSONDecodeError:
                                         # Handle plain text responses
                                         if chunk.strip():
@@ -164,6 +164,96 @@ async def stream_from_llm_space(prompt: str, temperature: float = 0.7, max_token
         final_response = {"done": True}
         yield f"data: {json.dumps(final_response)}\n\n"
 
+async def call_llm_space_once(prompt: str, temperature: float = 0.7, max_tokens: int = 150) -> str:
+    """Call the LLM Space once and return a full, aggregated response (non-streaming)."""
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "temperature": temperature,
+            "max_new_tokens": max_tokens,
+            "return_full_text": False,
+            "do_sample": True,
+            "stream": False
+        }
+    }
+
+    endpoints_to_try = [
+        f"{LLM_SPACE_URL}/api/generate",
+        f"{LLM_SPACE_URL}/v1/completions",
+        f"{LLM_SPACE_URL}/",
+    ]
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for endpoint in endpoints_to_try:
+                try:
+                    response = await client.post(endpoint, json=payload, headers=headers)
+                    if response.status_code != 200:
+                        continue
+
+                    # Try to parse JSON formats commonly returned by HF Spaces
+                    text = ""
+                    try:
+                        data = response.json()
+                        if isinstance(data, dict):
+                            if "choices" in data and data["choices"]:
+                                # OpenAI-like format
+                                choice = data["choices"][0]
+                                text = choice.get("text") or choice.get("message", {}).get("content", "")
+                            elif "generated_text" in data:
+                                text = data["generated_text"]
+                            elif "token" in data:
+                                text = data["token"].get("text", "")
+                            elif "outputs" in data and data["outputs"]:
+                                text = data["outputs"][0].get("text", "")
+                        elif isinstance(data, list) and data:
+                            # Some Spaces return a list of generated items
+                            item0 = data[0]
+                            if isinstance(item0, dict):
+                                text = item0.get("generated_text", "") or item0.get("text", "")
+                    except Exception:
+                        # Fallback to raw text
+                        text = response.text
+
+                    if not text:
+                        # Attempt to concatenate possible newline-delimited JSON chunks
+                        body = response.text
+                        assembled = []
+                        for line in body.splitlines():
+                            line = line.strip()
+                            if line.startswith("data: "):
+                                line = line[6:]
+                            if not line:
+                                continue
+                            try:
+                                piece = json.loads(line)
+                                if isinstance(piece, dict):
+                                    piece_text = piece.get("text") or piece.get("generated_text")
+                                    if not piece_text and "choices" in piece and piece["choices"]:
+                                        piece_text = piece["choices"][0].get("text", "")
+                                    if piece_text:
+                                        assembled.append(piece_text)
+                                elif isinstance(piece, str):
+                                    assembled.append(piece)
+                            except json.JSONDecodeError:
+                                assembled.append(line)
+                        text = "".join(assembled)
+
+                    if text:
+                        return text
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return ""
+
 @app.post("/api/generate")
 async def generate(request: GenerateRequest):
     """Generate endpoint matching Ollama's /api/generate"""
@@ -176,16 +266,22 @@ async def generate(request: GenerateRequest):
             ),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-cache, no-transform",
                 "Connection": "keep-alive",
                 "Access-Control-Allow-Origin": "*",
+                "X-Accel-Buffering": "no",
             }
         )
     else:
-        # Non-streaming response (simplified)
+        # Non-streaming response: call the LLM once and return the full text
+        text = await call_llm_space_once(
+            request.prompt,
+            request.temperature or 0.7,
+            request.max_tokens or 150,
+        )
         return {
-            "response": "Non-streaming mode: Please use stream=true for full functionality",
-            "done": True
+            "response": text or "",
+            "done": True,
         }
 
 @app.post("/api/chat")
@@ -203,15 +299,21 @@ async def chat(request: ChatRequest):
             ),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-cache, no-transform",
                 "Connection": "keep-alive",
                 "Access-Control-Allow-Origin": "*",
+                "X-Accel-Buffering": "no",
             }
         )
     else:
+        text = await call_llm_space_once(
+            prompt,
+            request.temperature or 0.7,
+            request.max_tokens or 150,
+        )
         return {
-            "response": "Non-streaming mode: Please use stream=true for full functionality",
-            "done": True
+            "message": {"role": "assistant", "content": text or ""},
+            "done": True,
         }
 
 @app.get("/")
@@ -223,6 +325,10 @@ async def root():
         "endpoints": ["/api/generate", "/api/chat"],
         "note": "This proxy forwards requests to another HF Space running an LLM"
     }
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
 
 @app.get("/api/tags")
 async def list_models():
@@ -240,6 +346,38 @@ async def list_models():
                 }
             }
         ]
+    }
+
+@app.get("/api/version")
+async def version():
+    """Return a version string compatible with Ollama clients."""
+    return {"version": "0.1.0"}
+
+@app.post("/api/pull")
+async def pull_model(payload: dict):
+    """No-op pull endpoint for clients that try to ensure a model is present."""
+    name = payload.get("name", "proxied-model")
+    return {
+        "status": "success",
+        "name": name,
+        "digest": "",
+    }
+
+@app.post("/api/show")
+async def show_model(payload: dict):
+    """Return minimal model info to satisfy Ollama clients."""
+    name = payload.get("name", "proxied-model")
+    return {
+        "model": name,
+        "modified_at": "2024-01-01T00:00:00Z",
+        "size": 0,
+        "digest": "",
+        "details": {
+            "format": "proxy",
+            "family": "llm-space-proxy",
+        },
+        "parameters": {},
+        "template": "",
     }
 
 if __name__ == "__main__":
